@@ -1,0 +1,13 @@
+output_folder: "C:/Users/aaron/Desktop/Prototyping/Essay Checker/Sample Run"
+create_timestamped_subfolder: true
+api_key: ""
+
+run_defaults:
+  model: "gpt-4.1-mini"
+  temperature: 0.0
+  resume_if_graded: true
+  export_per_question_files: false
+  export_per_student_combined: true
+  system_instruction: |
+    You are a strict but fair grading assistant. Grade only against the supplied rubric.
+    Do not invent evidence. Justify each criterion score briefly and clearly.

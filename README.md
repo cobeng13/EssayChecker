@@ -55,6 +55,7 @@ See `app_config.yaml.example` for the expected shape.
    - Set API key, choose one of the supported grading models, and set temperature when allowed.
    - The global system instruction can also be loaded from a `.txt` file.
    - GPT-5-family models use their default temperature only; the app disables custom temperature for them.
+   - GPT-4-family models use the existing Chat Completions path; GPT-5-family models use the newer Responses API path.
    - Review the rough token and USD cost estimate before starting.
    - `Set as default settings` writes the current startup defaults to `app_config.yaml`.
    - `Revert to stock configs` overwrites `app_config.yaml` with the built-in defaults and refreshes the UI.

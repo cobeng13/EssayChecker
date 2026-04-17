@@ -1,5 +1,6 @@
 import json
 import math
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -20,6 +21,9 @@ DEFAULT_SYSTEM_INSTRUCTION = (
 )
 
 MODEL_PRICING_USD_PER_1M: dict[str, dict[str, float]] = {
+    "gpt-5.4": {"input": 2.50, "output": 15.00},
+    "gpt-5.4-mini": {"input": 0.75, "output": 4.50},
+    "gpt-5.4-nano": {"input": 0.20, "output": 1.25},
     "gpt-5-mini": {"input": 0.25, "output": 2.00},
     "gpt-4.1-mini": {"input": 0.40, "output": 1.60},
     "gpt-4.1": {"input": 2.00, "output": 8.00},
@@ -40,6 +44,11 @@ def model_supports_custom_temperature(model: str) -> bool:
     return not any(normalized.startswith(prefix) for prefix in DEFAULT_ONLY_TEMPERATURE_MODEL_PREFIXES)
 
 
+def model_uses_responses_api(model: str) -> bool:
+    normalized = (model or "").strip().lower()
+    return normalized.startswith("gpt-5")
+
+
 def build_user_content(
     *,
     rubric: str,
@@ -50,11 +59,13 @@ def build_user_content(
     question_title: str,
     max_points: float,
 ) -> str:
+    effective_max_points = resolve_effective_max_points(rubric, max_points)
     return (
         "Grade this single response strictly using the provided rubric.\n\n"
         f"Question ID: {question_id}\n"
         f"Question title: {question_title or ''}\n"
-        f"Max points: {max_points}\n\n"
+        f"Configured max points: {max_points}\n"
+        f"Effective max points: {effective_max_points}\n\n"
         "=== RUBRIC ===\n"
         f"{rubric}\n\n"
         "=== MODEL ANSWER (optional reference) ===\n"
@@ -63,6 +74,8 @@ def build_user_content(
         f"{extra_instructions or '(none)'}\n\n"
         "=== STUDENT RESPONSE ===\n"
         f"{student_response}\n\n"
+        "Use the rubric's criterion point values as authoritative whenever they differ from the configured max points. "
+        "Make each criterion's points_awarded consistent with its rubric allocation, and make score_total equal the sum of the criterion points_awarded. "
         "Return ONLY a JSON object matching the schema."
     )
 
@@ -124,6 +137,84 @@ def make_client(api_key: str):
     return OpenAI(api_key=api_key)
 
 
+def _clean_criterion_name(name: str) -> str:
+    return re.sub(r"\s+", " ", (name or "").strip(" -:\t")).strip()
+
+
+def extract_rubric_criteria(rubric: str) -> list[dict[str, float | str]]:
+    criteria: list[dict[str, float | str]] = []
+    seen: set[tuple[str, float]] = set()
+    pattern = re.compile(
+        r"(?P<name>.+?)\s*\((?P<points>\d+(?:\.\d+)?)\s*points?\s*(?:possible|max(?:imum)?)\)",
+        re.IGNORECASE,
+    )
+    for raw_line in (rubric or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = pattern.search(line)
+        if not match:
+            continue
+        name = _clean_criterion_name(match.group("name"))
+        points = float(match.group("points"))
+        if not name:
+            continue
+        key = (name.casefold(), points)
+        if key in seen:
+            continue
+        seen.add(key)
+        criteria.append({"name": name, "max_points": points})
+    return criteria
+
+
+def resolve_effective_max_points(rubric: str, configured_max_points: float) -> float:
+    rubric_criteria = extract_rubric_criteria(rubric)
+    if rubric_criteria:
+        return float(sum(float(c["max_points"]) for c in rubric_criteria))
+    return float(configured_max_points)
+
+
+def _coerce_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _normalize_criteria(criteria: list[Any], rubric: str) -> tuple[list[dict[str, Any]], float]:
+    rubric_criteria = extract_rubric_criteria(rubric)
+    if not rubric_criteria:
+        normalized: list[dict[str, Any]] = []
+        for item in criteria or []:
+            if not isinstance(item, dict):
+                continue
+            normalized.append(
+                {
+                    "name": str(item.get("name", "")).strip(),
+                    "points_awarded": _coerce_float(item.get("points_awarded", 0)),
+                    "justification": str(item.get("justification", "")).strip(),
+                }
+            )
+        total = sum(_coerce_float(item.get("points_awarded", 0)) for item in normalized)
+        return normalized, total
+
+    normalized = []
+    for idx, rubric_item in enumerate(rubric_criteria):
+        source = criteria[idx] if idx < len(criteria) and isinstance(criteria[idx], dict) else {}
+        max_points = float(rubric_item["max_points"])
+        points_awarded = _coerce_float(source.get("points_awarded", 0))
+        points_awarded = max(0.0, min(points_awarded, max_points))
+        normalized.append(
+            {
+                "name": str(rubric_item["name"]),
+                "points_awarded": points_awarded,
+                "justification": str(source.get("justification", "")).strip(),
+            }
+        )
+    total = sum(float(item["points_awarded"]) for item in normalized)
+    return normalized, total
+
+
 def _schema(max_points: float) -> dict[str, Any]:
     return {
         "name": "question_grading_result",
@@ -164,6 +255,82 @@ def _schema(max_points: float) -> dict[str, Any]:
     }
 
 
+def _response_json_schema(max_points: float) -> dict[str, Any]:
+    schema = _schema(max_points)
+    return {
+        "type": "json_schema",
+        "name": schema["name"],
+        "schema": schema["schema"],
+        "strict": True,
+    }
+
+
+def _parse_response_text(response: Any) -> str:
+    output_text = getattr(response, "output_text", None)
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text
+
+    output = getattr(response, "output", None)
+    if isinstance(output, list):
+        for item in output:
+            content = getattr(item, "content", None)
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                text = getattr(block, "text", None)
+                if isinstance(text, str) and text.strip():
+                    return text
+
+    raise ValueError("Responses API returned no text output.")
+
+
+def _create_legacy_chat_completion(
+    client: Any,
+    *,
+    model: str,
+    temperature: float,
+    system_instruction: str,
+    user_content: str,
+    schema: dict[str, Any],
+) -> str:
+    request_kwargs = {
+        "model": model,
+        "messages": [{"role": "system", "content": system_instruction}, {"role": "user", "content": user_content}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema["name"],
+                "schema": schema["schema"],
+                "strict": True,
+            },
+        },
+    }
+    if model_supports_custom_temperature(model):
+        request_kwargs["temperature"] = temperature
+
+    response = client.chat.completions.create(**request_kwargs)
+    return response.choices[0].message.content
+
+
+def _create_responses_completion(
+    client: Any,
+    *,
+    model: str,
+    system_instruction: str,
+    user_content: str,
+    max_points: float,
+) -> str:
+    response = client.responses.create(
+        model=model,
+        input=[
+            {"role": "system", "content": [{"type": "input_text", "text": system_instruction}]},
+            {"role": "user", "content": [{"type": "input_text", "text": user_content}]},
+        ],
+        text={"format": _response_json_schema(max_points)},
+    )
+    return _parse_response_text(response)
+
+
 def grade_response(
     client: Any,
     *,
@@ -183,6 +350,8 @@ def grade_response(
     if not rubric.strip():
         raise ValueError(f"Question {question_id} is missing rubric text.")
 
+    effective_max_points = resolve_effective_max_points(rubric, max_points)
+
     user_content = build_user_content(
         rubric=rubric,
         model_answer=model_answer,
@@ -190,44 +359,48 @@ def grade_response(
         student_response=student_response,
         question_id=question_id,
         question_title=question_title,
-        max_points=max_points,
+        max_points=effective_max_points,
     )
 
-    schema = _schema(max_points=max_points)
+    schema = _schema(max_points=effective_max_points)
     last_error: Exception | None = None
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            request_kwargs = {
-                "model": model,
-                "messages": [{"role": "system", "content": system_instruction}, {"role": "user", "content": user_content}],
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": schema["name"],
-                        "schema": schema["schema"],
-                        "strict": True,
-                    },
-                },
-            }
-            if model_supports_custom_temperature(model):
-                request_kwargs["temperature"] = temperature
+            if model_uses_responses_api(model):
+                raw_content = _create_responses_completion(
+                    client,
+                    model=model,
+                    system_instruction=system_instruction,
+                    user_content=user_content,
+                    max_points=effective_max_points,
+                )
+            else:
+                raw_content = _create_legacy_chat_completion(
+                    client,
+                    model=model,
+                    temperature=temperature,
+                    system_instruction=system_instruction,
+                    user_content=user_content,
+                    schema=schema,
+                )
 
-            resp = client.chat.completions.create(
-                **request_kwargs
-            )
-            data = json.loads(resp.choices[0].message.content)
-            score_total = float(data.get("score_total", 0))
-            score_total = max(0.0, min(score_total, float(max_points)))
+            data = json.loads(raw_content)
+            criteria, criteria_total = _normalize_criteria(data.get("criteria", []), rubric)
+            if extract_rubric_criteria(rubric):
+                score_total = criteria_total
+            else:
+                score_total = _coerce_float(data.get("score_total", criteria_total))
+            score_total = max(0.0, min(score_total, float(effective_max_points)))
             data["score_total"] = score_total
             return {
                 "student_id": student_id,
                 "student_name": student_name,
                 "question_id": question_id,
                 "question_title": question_title,
-                "max_points": float(max_points),
+                "max_points": float(effective_max_points),
                 "score_total": score_total,
-                "criteria": data.get("criteria", []),
+                "criteria": criteria,
                 "feedback": data.get("feedback", ""),
                 "flags": data.get("flags", {}),
                 "raw_response_text": student_response,

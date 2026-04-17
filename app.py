@@ -39,6 +39,7 @@ from grader import (
     make_client,
     model_supports_custom_temperature,
     openai_available,
+    resolve_effective_max_points,
 )
 from questions import QuestionConfig, auto_map_questions, next_question_id
 from utils import APP_VERSION, app_dir, hash_text
@@ -47,6 +48,9 @@ from utils import APP_VERSION, app_dir, hash_text
 NONE_SENTINEL = "(None)"
 MODEL_PICKER_OPTIONS = [
     ("gpt-4.1-mini", "gpt-4.1-mini - Stable default for rubric grading"),
+    ("gpt-5.4-mini", "gpt-5.4-mini - Stronger grading, Responses API path"),
+    ("gpt-5.4-nano", "gpt-5.4-nano - Cheapest GPT-5.4 option"),
+    ("gpt-5.4", "gpt-5.4 - Highest quality GPT-5.4 option"),
     ("gpt-5-mini", "gpt-5-mini - Balanced quality, default temperature only"),
     ("gpt-4o-mini", "gpt-4o-mini - Lowest cost, weaker grading judgment"),
     ("gpt-4.1", "gpt-4.1 - Higher grading quality, higher cost"),
@@ -54,6 +58,7 @@ MODEL_PICKER_OPTIONS = [
 ]
 MODEL_LABEL_TO_ID = {label: model_id for model_id, label in MODEL_PICKER_OPTIONS}
 MODEL_ID_TO_LABEL = {model_id: label for model_id, label in MODEL_PICKER_OPTIONS}
+MODEL_ID_TO_DESCRIPTION = {model_id: label.split(" - ", 1)[1] if " - " in label else label for model_id, label in MODEL_PICKER_OPTIONS}
 
 
 @dataclass
@@ -222,6 +227,80 @@ def load_app_defaults() -> tuple[AppDefaults, list[str]]:
     return defaults, warnings
 
 
+def _load_existing_run_config(run_dir: Path) -> dict | None:
+    path = run_dir / "run_config.json"
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise RuntimeError(f"Existing run config could not be read: {e}") from e
+    if not isinstance(raw, dict):
+        raise RuntimeError("Existing run config is not a valid object.")
+    return raw
+
+
+def _normalize_resume_question_mapping(mapping: dict | None) -> dict[str, dict]:
+    if not isinstance(mapping, dict):
+        return {}
+    normalized: dict[str, dict] = {}
+    for question_id, raw in mapping.items():
+        if not isinstance(raw, dict):
+            continue
+        normalized[str(question_id)] = {
+            "columns": list(raw.get("columns", []) or []),
+            "rubric_hash": raw.get("rubric_hash"),
+            "configured_max_points": raw.get("configured_max_points", raw.get("max_points")),
+            "effective_max_points": raw.get("effective_max_points", raw.get("max_points")),
+        }
+    return normalized
+
+
+def validate_resume_compatibility(run_dir: Path, current_config: dict):
+    existing = _load_existing_run_config(run_dir)
+    if not existing:
+        return
+
+    mismatches: list[str] = []
+    current_model = ((current_config.get("model_settings") or {}).get("model") or "").strip()
+    existing_model = ((existing.get("model_settings") or {}).get("model") or "").strip()
+    if existing_model and current_model != existing_model:
+        mismatches.append(f"model: existing '{existing_model}' vs selected '{current_model}'")
+
+    current_temp = (current_config.get("model_settings") or {}).get("temperature")
+    existing_temp = (existing.get("model_settings") or {}).get("temperature")
+    if existing_temp is not None and current_temp != existing_temp:
+        mismatches.append(f"temperature: existing '{existing_temp}' vs selected '{current_temp}'")
+
+    current_sys_hash = current_config.get("system_instruction_hash")
+    existing_sys_hash = existing.get("system_instruction_hash")
+    if existing_sys_hash and current_sys_hash != existing_sys_hash:
+        mismatches.append("system instruction differs")
+
+    current_csv = (current_config.get("input_csv_path") or "").strip()
+    existing_csv = (existing.get("input_csv_path") or "").strip()
+    if existing_csv and current_csv != existing_csv:
+        mismatches.append(f"input CSV: existing '{existing_csv}' vs selected '{current_csv}'")
+
+    current_detected = current_config.get("detected") or {}
+    existing_detected = existing.get("detected") or {}
+    for key in ("first_col", "last_col", "name_col", "id_col", "response_columns"):
+        if key in existing_detected and current_detected.get(key) != existing_detected.get(key):
+            mismatches.append(f"detected setting '{key}' differs")
+
+    current_questions = _normalize_resume_question_mapping(current_config.get("question_mapping"))
+    existing_questions = _normalize_resume_question_mapping(existing.get("question_mapping"))
+    if existing_questions and current_questions != existing_questions:
+        mismatches.append("question mapping or rubric/max settings differ")
+
+    if mismatches:
+        mismatch_text = "; ".join(mismatches)
+        raise RuntimeError(
+            "Resume refused because the selected run settings do not match the existing run metadata. "
+            f"{mismatch_text}. Start a new run or restore the original settings."
+        )
+
+
 class Step1Frame(ttk.Frame):
     def __init__(self, parent, state: AppState, defaults: AppDefaults):
         super().__init__(parent)
@@ -251,7 +330,7 @@ class Step1Frame(ttk.Frame):
 
         row1 = ttk.Frame(top)
         row1.pack(fill="x", padx=8, pady=6)
-        ttk.Label(row1, text="LMS CSV file:").pack(side="left")
+        ttk.Label(row1, text="LMS CSV/JSON/HTML file:").pack(side="left")
         ttk.Entry(row1, textvariable=self.csv_var, width=80).pack(side="left", padx=6, fill="x", expand=True)
         ttk.Button(row1, text="Browse", command=self._pick_csv).pack(side="left")
 
@@ -314,7 +393,16 @@ class Step1Frame(ttk.Frame):
         self.preview_tree.configure(yscrollcommand=sy.set, xscrollcommand=sx.set)
 
     def _pick_csv(self):
-        path = filedialog.askopenfilename(title="Select LMS CSV", filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        path = filedialog.askopenfilename(
+            title="Select LMS CSV, JSON, or HTML",
+            filetypes=[
+                ("CSV, JSON, or HTML files", "*.csv *.json *.html *.htm"),
+                ("CSV files", "*.csv"),
+                ("JSON files", "*.json"),
+                ("HTML files", "*.html *.htm"),
+                ("All files", "*.*"),
+            ],
+        )
         if path:
             self.csv_var.set(path)
             if not self.out_var.get().strip():
@@ -351,12 +439,12 @@ class Step1Frame(ttk.Frame):
     def load_and_detect(self):
         csv_path = self.csv_var.get().strip()
         if not csv_path:
-            messagebox.showwarning("CSV required", "Please choose a CSV file first.")
+            messagebox.showwarning("Input required", "Please choose a CSV, JSON, or HTML file first.")
             return
         try:
             prev = load_preview(csv_path, max_rows=10)
         except Exception as e:
-            messagebox.showerror("CSV error", str(e))
+            messagebox.showerror("Input error", str(e))
             return
 
         self.state.preview = prev
@@ -404,10 +492,10 @@ class Step1Frame(ttk.Frame):
         csv_path = self.csv_var.get().strip()
         out = self.out_var.get().strip()
         if not csv_path:
-            messagebox.showwarning("Missing CSV", "Please select an input CSV.")
+            messagebox.showwarning("Missing input file", "Please select an input CSV, JSON, or HTML file.")
             return False
         if not Path(csv_path).exists():
-            messagebox.showwarning("Missing CSV", "The selected CSV path does not exist.")
+            messagebox.showwarning("Missing input file", "The selected input file path does not exist.")
             return False
         if not out:
             messagebox.showwarning("Missing output folder", "Please select an output folder.")
@@ -881,6 +969,8 @@ class Step4Frame(ttk.Frame):
         self.msg_queue: queue.Queue[tuple[str, dict]] = queue.Queue()
         self.total_tasks = 0
         self.done_tasks = 0
+        self._estimate_refresh_after_id: str | None = None
+        self._estimate_cache: tuple[int, int, int] | None = None
         self._build_ui()
         self.after(150, self._poll_queue)
 
@@ -902,6 +992,7 @@ class Step4Frame(ttk.Frame):
         ttk.Label(row1, text="OpenAI API key").pack(side="left")
         self.api_entry = ttk.Entry(row1, textvariable=self.api_key_var, width=50, show="*")
         self.api_entry.pack(side="left", padx=6)
+        ttk.Button(row1, text="Load .txt", command=self._load_api_key_file).pack(side="left", padx=(0, 6))
         ttk.Button(row1, text="Show/Hide", command=self._toggle_key).pack(side="left")
 
         row2 = ttk.Frame(top)
@@ -919,6 +1010,17 @@ class Step4Frame(ttk.Frame):
         ttk.Label(row2, text="Temperature").pack(side="left", padx=(12, 4))
         self.temp_entry = ttk.Entry(row2, textvariable=self.temp_var, width=8)
         self.temp_entry.pack(side="left")
+
+        row2a = ttk.Frame(top)
+        row2a.pack(fill="x", padx=8, pady=(0, 4))
+        self.model_description_var = tk.StringVar(value="")
+        ttk.Label(
+            row2a,
+            textvariable=self.model_description_var,
+            justify="left",
+            wraplength=1080,
+            foreground="#555555",
+        ).pack(anchor="w")
 
         row2b = ttk.Frame(top)
         row2b.pack(fill="x", padx=8, pady=(0, 4))
@@ -976,6 +1078,16 @@ class Step4Frame(ttk.Frame):
     def _toggle_key(self):
         self.api_entry.config(show="" if self.api_entry.cget("show") else "*")
 
+    def _load_api_key_file(self):
+        content = pick_text_file_and_read(self, "Load OpenAI API key from .txt file")
+        if content is None:
+            return
+        key = next((line.strip() for line in content.splitlines() if line.strip()), "")
+        if not key:
+            messagebox.showwarning("API key file", "The selected file did not contain a non-empty API key.")
+            return
+        self.api_key_var.set(key)
+
     def _load_system_instruction_file(self):
         content = pick_text_file_and_read(self, "Load global system instruction")
         if content is None:
@@ -994,6 +1106,8 @@ class Step4Frame(ttk.Frame):
             self.model_var.set(resolved)
         else:
             self.model_var.set(DEFAULT_MODEL)
+        model = self.model_var.get().strip() or DEFAULT_MODEL
+        self.model_description_var.set(MODEL_ID_TO_DESCRIPTION.get(model, ""))
         self._apply_temperature_behavior()
 
     def _apply_temperature_behavior(self):
@@ -1008,14 +1122,55 @@ class Step4Frame(ttk.Frame):
 
     def _on_model_choice_changed(self, _event=None):
         self._apply_model_selection()
-        self.refresh_estimate()
+        self._refresh_estimate_display_only()
 
     def _schedule_estimate_refresh(self, *_args):
-        self.after(100, self.refresh_estimate)
+        if self._estimate_refresh_after_id:
+            self.after_cancel(self._estimate_refresh_after_id)
+        self._estimate_refresh_after_id = self.after(100, self._refresh_estimate_display_only)
+
+    def _refresh_estimate_display_only(self):
+        self._estimate_refresh_after_id = None
+        self._apply_model_selection()
+        if self._estimate_cache is None:
+            self.refresh_estimate()
+            return
+        total_calls, total_input_tokens, total_output_tokens = self._estimate_cache
+        self._render_estimate(total_calls, total_input_tokens, total_output_tokens)
+
+    def _render_estimate(self, total_calls: int, total_input_tokens: int, total_output_tokens: int):
+        model = self._resolved_model() or DEFAULT_MODEL
+        self.model_var.set(model)
+        pricing = MODEL_PRICING_USD_PER_1M.get(model)
+        estimate_line = (
+            f"Approximate API calls: {total_calls} | Input tokens: {total_input_tokens:,} | "
+            f"Output tokens: {total_output_tokens:,}"
+        )
+        if pricing:
+            usd = (
+                (total_input_tokens / 1_000_000) * pricing["input"]
+                + (total_output_tokens / 1_000_000) * pricing["output"]
+            )
+            estimate_line += f" | Estimated cost: ${usd:,.4f}"
+            note = (
+                f"Pricing basis for {model}: input ${pricing['input']}/1M, output ${pricing['output']}/1M tokens. "
+                "Token counts are rough estimates from prompt length, not tokenizer-exact. Empty responses are excluded."
+            )
+        else:
+            note = (
+                f"No built-in pricing data for {model}. Token counts are still shown, but USD cost is unavailable. "
+                "Token counts are rough estimates from prompt length, not tokenizer-exact."
+            )
+
+        if self.resume_var.get():
+            note += " Resume skips are not estimated in advance."
+        self.estimate_var.set(estimate_line)
+        self.pricing_note_var.set(note)
 
     def refresh_estimate(self):
         self._apply_model_selection()
         if not self.state.csv_path or not self.state.questions:
+            self._estimate_cache = None
             self.estimate_var.set("Estimate unavailable until CSV and questions are configured.")
             self.pricing_note_var.set("")
             return
@@ -1030,6 +1185,7 @@ class Step4Frame(ttk.Frame):
                 self.state.selected_response_cols,
             )
         except Exception as e:
+            self._estimate_cache = None
             self.estimate_var.set(f"Estimate unavailable: {e}")
             self.pricing_note_var.set("")
             return
@@ -1060,33 +1216,8 @@ class Step4Frame(ttk.Frame):
                 total_input_tokens += input_tokens
                 total_output_tokens += output_tokens
 
-        model = self._resolved_model() or DEFAULT_MODEL
-        self.model_var.set(model)
-        pricing = MODEL_PRICING_USD_PER_1M.get(model)
-        estimate_line = (
-            f"Approximate API calls: {total_calls} | Input tokens: {total_input_tokens:,} | "
-            f"Output tokens: {total_output_tokens:,}"
-        )
-        if pricing:
-            usd = (
-                (total_input_tokens / 1_000_000) * pricing["input"]
-                + (total_output_tokens / 1_000_000) * pricing["output"]
-            )
-            estimate_line += f" | Estimated cost: ${usd:,.4f}"
-            note = (
-                f"Pricing basis for {model}: input ${pricing['input']}/1M, output ${pricing['output']}/1M tokens. "
-                "Token counts are rough estimates from prompt length, not tokenizer-exact. Empty responses are excluded."
-            )
-        else:
-            note = (
-                f"No built-in pricing data for {model}. Token counts are still shown, but USD cost is unavailable. "
-                "Token counts are rough estimates from prompt length, not tokenizer-exact."
-            )
-
-        if self.resume_var.get():
-            note += " Resume skips are not estimated in advance."
-        self.estimate_var.set(estimate_line)
-        self.pricing_note_var.set(note)
+        self._estimate_cache = (total_calls, total_input_tokens, total_output_tokens)
+        self._render_estimate(total_calls, total_input_tokens, total_output_tokens)
 
     def on_show(self):
         self._apply_model_selection()
@@ -1183,7 +1314,6 @@ class Step4Frame(ttk.Frame):
             )
             run_log_path = run_dir / "logs" / "run.log"
             error_log_path = run_dir / "logs" / "errors.log"
-            write_log(run_log_path, "Run started.")
             self._log(f"Run folder: {run_dir}")
 
             client = make_client(self.api_key_var.get().strip())
@@ -1202,10 +1332,16 @@ class Step4Frame(ttk.Frame):
                     "original_headers": headers,
                 },
                 "question_mapping": {
-                    q.question_id: {"columns": q.columns, "rubric_hash": hash_text(q.rubric), "max_points": q.max_points}
+                    q.question_id: {
+                        "columns": q.columns,
+                        "rubric_hash": hash_text(q.rubric),
+                        "configured_max_points": q.max_points,
+                        "effective_max_points": resolve_effective_max_points(q.rubric, q.max_points),
+                    }
                     for q in self.state.questions
                 },
                 "model_settings": {"model": model, "temperature": temperature},
+                "system_instruction_hash": hash_text(system_instruction),
                 "options": {
                     "resume": self.resume_var.get(),
                     "export_per_question_files": self.export_pq_var.get(),
@@ -1213,7 +1349,10 @@ class Step4Frame(ttk.Frame):
                 },
                 "app_version": APP_VERSION,
             }
+            if self.resume_var.get():
+                validate_resume_compatibility(run_dir, config)
             write_run_config(run_dir, config)
+            write_log(run_log_path, "Run started.")
 
             total = len(students) * len(self.state.questions)
             done = 0
@@ -1289,7 +1428,10 @@ class Step4Frame(ttk.Frame):
                     )
                     results_index[(student.student_id, q.question_id)] = result
                     write_log(run_log_path, f"{student.safe_stem}::{q.question_id}::{result.get('score_total', '')}")
-                    self._log(f"DONE {student.display_name} {q.question_id}: {result.get('score_total')} / {q.max_points}")
+                    self._log(
+                        f"DONE {student.display_name} {q.question_id}: "
+                        f"{result.get('score_total')} / {result.get('max_points', q.max_points)}"
+                    )
                     done += 1
                     self._set_progress(done, total, label)
                 if self.stop_event.is_set():
